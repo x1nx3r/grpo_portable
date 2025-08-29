@@ -1,3 +1,14 @@
+# Minimal requirements for running the GRPO portable scripts
+# For best performance on GPU, install a matching `torch` wheel from pytorch.org
+torch
+transformers>=4.30.0
+datasets
+peft
+accelerate
+safetensors
+sentencepiece
+tqdm
+typing-extensions
 # Minimal requirements inferred from the scripts
 transformers>=4.35.0
 torch>=2.2.0

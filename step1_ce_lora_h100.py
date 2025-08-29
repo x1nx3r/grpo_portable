@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Step 1 (LoRA): CE finetune that trains only LoRA adapter params to teach canonical tags
+"""H100-optimized Step 1 (LoRA): CE finetune tuned for powerful GPUs (bf16)
 
-This script applies a small LoRA adapter, runs a short cross-entropy pass on
-synthetic SFT data, and saves the adapter. Designed for low-memory training.
+This script mirrors `step1_ce_lora.py` but changes sensible defaults for an
+H100-class GPU: bf16, larger LoRA rank/alpha, bigger batch sizes, optional
+gradient checkpointing and a few additional hyperparameters exposed.
 """
 import argparse
 import logging
@@ -33,28 +34,31 @@ except Exception:
     get_peft_model = None
     prepare_model_for_kbit_training = None
 
-logger = logging.getLogger('step1_ce_lora')
+logger = logging.getLogger('step1_ce_lora_h100')
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
+
 def parse_args(argv):
     p = argparse.ArgumentParser()
-    # Defaults tuned for a constrained L4 GPU: small per-device batch, higher grad-accum
     p.add_argument('--model', default=os.environ.get('MODEL_LOCAL_PATH','./downloaded_models/llama-3.2-3b'))
-    p.add_argument('--output', default='./format_sft_lora')
-    p.add_argument('--sft_samples', type=int, default=1000)
-    # point to the prepared full canonical SFT by default (full CE on L4 will use grad-accum)
+    p.add_argument('--output', default='./format_sft_lora_h100')
+    p.add_argument('--sft_samples', type=int, default=8000)
     p.add_argument('--sft_file', default='./grpo_portable/sft_from_deepseek_full.canonical.jsonl',
                    help='Path to JSONL SFT file with {"prompt","completion"} per line (optional)')
-    p.add_argument('--ce_epochs', type=int, default=4)
-    # keep small per-device batch for L4 and increase effective batch via grad-accum
-    p.add_argument('--ce_batch', type=int, default=4)
-    # conservative low-r LoRA for limited VRAM
-    p.add_argument('--lora_r', type=int, default=8)
-    p.add_argument('--lora_alpha', type=int, default=32)
-    p.add_argument('--grad_accum', type=int, default=8, help='Gradient accumulation steps to increase effective batch size')
+    p.add_argument('--ce_epochs', type=int, default=3)
+    # larger per-device batch assumed on H100
+    p.add_argument('--ce_batch', type=int, default=32)
+    # larger LoRA rank for richer adapters
+    p.add_argument('--lora_r', type=int, default=64)
+    p.add_argument('--lora_alpha', type=int, default=128)
+    p.add_argument('--lora_dropout', type=float, default=0.1)
+    p.add_argument('--lr', type=float, default=2e-4)
+    p.add_argument('--weight_decay', type=float, default=0.0)
+    p.add_argument('--grad_accum', type=int, default=1)
     p.add_argument('--device', choices=['auto','cpu','gpu'], default='auto')
-    p.add_argument('--save_adapter_name', default='adapter_lora')
+    p.add_argument('--save_adapter_name', default='adapter_lora_h100')
+    p.add_argument('--use_grad_checkpoint', action='store_true', help='Enable gradient checkpointing if supported')
     return p.parse_args(argv)
 
 
@@ -72,26 +76,18 @@ def main(argv):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
 
     model_kwargs = dict(trust_remote_code=True)
-    # Choose device_map and dtype: prefer fp16 on GPU when available to save memory
+    # On H100 prefer bf16
     if args.device == 'cpu':
         model_kwargs['device_map'] = 'cpu'
         model_kwargs['torch_dtype'] = torch.float32
-        use_fp16 = False
-    elif args.device == 'gpu':
+        use_bf16 = False
+    else:
         model_kwargs['device_map'] = 'auto'
-        # If torch is available and has CUDA, use float16 for smaller memory footprint
-        model_kwargs['torch_dtype'] = getattr(torch, 'float16', torch.float32)
-        use_fp16 = True
-    else:  # auto
-        model_kwargs['device_map'] = 'auto'
-        if torch is not None and torch.cuda.is_available():
-            model_kwargs['torch_dtype'] = getattr(torch, 'float16', torch.float32)
-            use_fp16 = True
-        else:
-            model_kwargs['torch_dtype'] = torch.float32
-            use_fp16 = False
+        # use bf16 where available
+        model_kwargs['torch_dtype'] = getattr(torch, 'bfloat16', torch.float32)
+        use_bf16 = True
 
-    logger.info('Loading base model (this may be memory-heavy)')
+    logger.info('Loading base model (H100 tune: bf16 recommended)')
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
     os.makedirs(args.output, exist_ok=True)
@@ -102,6 +98,7 @@ def main(argv):
         r=args.lora_r,
         target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
         lora_alpha=args.lora_alpha,
+        lora_dropout=args.lora_dropout,
         bias='none',
         task_type='CAUSAL_LM'
     )
@@ -113,8 +110,6 @@ def main(argv):
 
     # ensure only LoRA params will be trained
     for n, p in model.named_parameters():
-        # PEFT should mark adapter params as requires_grad=True and base as False,
-        # but make explicit: freeze base parameters if not in adapter
         if 'lora' not in n and 'adapter' not in n:
             p.requires_grad = False
 
@@ -135,7 +130,6 @@ def main(argv):
                         except Exception:
                             logger.debug('Skipping malformed JSONL line %d in %s', i, args.sft_file)
                             continue
-                        # prefer explicit prompt/completion fields
                         if isinstance(rec, dict) and 'prompt' in rec and 'completion' in rec:
                             sft.append({'prompt': rec['prompt'], 'completion': rec['completion']})
                 logger.info('Loaded %d SFT examples from %s', len(sft), args.sft_file)
@@ -151,18 +145,16 @@ def main(argv):
         logger.info('Building synthetic SFT dataset: %d samples', args.sft_samples)
         sft = build_synthetic_dataset(n_samples=args.sft_samples)
 
-    # tokenize small dataset
+    # simple tokenization helper
     def tokenize_fn(x):
         inp = x['prompt']
         tgt = x['completion']
-        enc = tokenizer(inp + '\n' + tgt, truncation=True, padding='max_length', max_length=512)
+        enc = tokenizer(inp + '\n' + tgt, truncation=True, padding='max_length', max_length=1024)
         enc['labels'] = enc['input_ids'].copy()
         return enc
 
     try:
-        # keep simple: transform into list of tokenized dicts
         tok_list = [tokenize_fn(x) for x in sft]
-        # if datasets available, convert to HF Dataset to use Trainer properly
         try:
             from datasets import Dataset as HFDataset
             train_ds = HFDataset.from_list(tok_list)
@@ -176,21 +168,31 @@ def main(argv):
         logger.error('transformers.Trainer not available; cannot run CE')
         return 1
 
-    logger.info('Using fp16=%s (device=%s, dtype=%s)', use_fp16, args.device, model_kwargs.get('torch_dtype'))
+    logger.info('Using bf16=%s (device=%s, dtype=%s)', use_bf16, args.device, model_kwargs.get('torch_dtype'))
 
     args_tr = TrainingArguments(
         output_dir=args.output,
         num_train_epochs=args.ce_epochs,
         per_device_train_batch_size=args.ce_batch,
         gradient_accumulation_steps=max(1, args.grad_accum),
-        logging_steps=10,
+        logging_steps=50,
         save_strategy='no',
-        fp16=bool(use_fp16),
+        bf16=bool(use_bf16),
+        learning_rate=args.lr,
+        weight_decay=args.weight_decay,
     )
+
+    # optionally enable gradient checkpointing if user requested and model supports it
+    try:
+        if args.use_grad_checkpoint and hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+            logger.info('Enabled model.gradient_checkpointing')
+    except Exception:
+        logger.exception('Failed to enable gradient checkpointing (continuing)')
 
     trainer = Trainer(model=model, args=args_tr, train_dataset=train_ds)
 
-    logger.info('Starting LoRA CE finetune: %d examples, epochs=%d, batch=%d', len(sft), args.ce_epochs, args.ce_batch)
+    logger.info('Starting H100-tuned LoRA CE finetune: %d examples, epochs=%d, batch=%d', len(sft), args.ce_epochs, args.ce_batch)
     trainer.train()
 
     # save adapter only
