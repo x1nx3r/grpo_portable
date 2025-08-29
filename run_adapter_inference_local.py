@@ -39,6 +39,7 @@ def parse_args(argv: List[str]):
     p.add_argument('--prompt', default=None, help='Single prompt to run (overrides synthetic samples)')
     p.add_argument('--n_samples', type=int, default=3, help='Number of synthetic prompts to run when --prompt is not given')
     p.add_argument('--max_new_tokens', type=int, default=128)
+    p.add_argument('--no_prefix_think', action='store_true', help='Disable automatic prefixing of prompts with "<think>"')
     return p.parse_args(argv)
 
 
@@ -84,10 +85,24 @@ def load_model_with_adapter(args, tokenizer=None, dtype=None):
 
 def build_prompts(args):
     if args.prompt:
-        return [args.prompt]
-    # synthetic format prompts from phase1_utils
-    samples = build_synthetic_dataset(n_samples=args.n_samples)
-    return [s['prompt'] for s in samples]
+        prompts = [args.prompt]
+    else:
+        # synthetic format prompts from phase1_utils
+        samples = build_synthetic_dataset(n_samples=args.n_samples)
+        prompts = [s['prompt'] for s in samples]
+
+    # prefix with opening <think> tag unless explicitly disabled or already present
+    if not getattr(args, 'no_prefix_think', False):
+        prefixed = []
+        for p in prompts:
+            # avoid double-prefixing; check case-insensitively
+            if '<think>' in p.lower():
+                prefixed.append(p)
+            else:
+                prefixed.append(f"<think>\n{p}")
+        prompts = prefixed
+
+    return prompts
 
 
 def generate_and_print(model, tokenizer, prompts, max_new_tokens=128):
