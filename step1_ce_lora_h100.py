@@ -44,7 +44,9 @@ def parse_args(argv):
     p.add_argument('--model', default=os.environ.get('MODEL_LOCAL_PATH','./downloaded_models/llama-3.2-3b'))
     p.add_argument('--output', default='./format_sft_lora_h100')
     p.add_argument('--sft_samples', type=int, default=8000)
-    p.add_argument('--sft_file', default='./grpo_portable/sft_from_deepseek_full.canonical.jsonl',
+    # default to repo-root JSONL (previous default pointed to ./grpo_portable/...,
+    # which caused a duplicate path when running from the repo root)
+    p.add_argument('--sft_file', default='./sft_from_deepseek_full.canonical.jsonl',
                    help='Path to JSONL SFT file with {"prompt","completion"} per line (optional)')
     p.add_argument('--ce_epochs', type=int, default=3)
     # larger per-device batch assumed on H100
@@ -58,7 +60,9 @@ def parse_args(argv):
     p.add_argument('--grad_accum', type=int, default=1)
     p.add_argument('--device', choices=['auto','cpu','gpu'], default='auto')
     p.add_argument('--save_adapter_name', default='adapter_lora_h100')
-    p.add_argument('--use_grad_checkpoint', action='store_true', help='Enable gradient checkpointing if supported')
+    # enable gradient checkpointing by default on H100; keep flag to allow future explicit control
+    p.add_argument('--use_grad_checkpoint', action='store_true', default=True,
+                   help='Enable gradient checkpointing if supported (default: True)')
     return p.parse_args(argv)
 
 
@@ -93,6 +97,21 @@ def main(argv):
     os.makedirs(args.output, exist_ok=True)
     tokenizer, model = add_special_tokens_and_resize(tokenizer, model, save_dir=args.output)
 
+    # optionally enable gradient checkpointing early (before PEFT wrapping) to save activation memory
+    if args.use_grad_checkpoint:
+        try:
+            if hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+                # disable use_cache to be compatible with gradient checkpointing
+                if hasattr(model, 'config'):
+                    try:
+                        model.config.use_cache = False
+                    except Exception:
+                        logger.debug('Failed to set model.config.use_cache=False')
+                logger.info('Enabled model.gradient_checkpointing and set use_cache=False')
+        except Exception:
+            logger.exception('Failed to enable gradient checkpointing (continuing)')
+
     # apply LoRA adapter
     lora_conf = LoraConfig(
         r=args.lora_r,
@@ -117,10 +136,18 @@ def main(argv):
     sft = None
     if args.sft_file:
         try:
-            if os.path.exists(args.sft_file):
-                logger.info('Loading SFT examples from %s', args.sft_file)
+            # prefer the path provided, but if it doesn't exist try a repo-root basename
+            sft_path = args.sft_file
+            if not os.path.exists(sft_path):
+                alt = os.path.join('.', os.path.basename(sft_path))
+                if os.path.exists(alt):
+                    logger.info('SFT file %s not found, using fallback %s', sft_path, alt)
+                    sft_path = alt
+
+            if os.path.exists(sft_path):
+                logger.info('Loading SFT examples from %s', sft_path)
                 sft = []
-                with open(args.sft_file, 'r', encoding='utf-8') as fh:
+                with open(sft_path, 'r', encoding='utf-8') as fh:
                     for i, line in enumerate(fh):
                         line = line.strip()
                         if not line:
@@ -182,13 +209,7 @@ def main(argv):
         weight_decay=args.weight_decay,
     )
 
-    # optionally enable gradient checkpointing if user requested and model supports it
-    try:
-        if args.use_grad_checkpoint and hasattr(model, 'gradient_checkpointing_enable'):
-            model.gradient_checkpointing_enable()
-            logger.info('Enabled model.gradient_checkpointing')
-    except Exception:
-        logger.exception('Failed to enable gradient checkpointing (continuing)')
+    # gradient checkpointing handled earlier (before PEFT wrapping)
 
     trainer = Trainer(model=model, args=args_tr, train_dataset=train_ds)
 

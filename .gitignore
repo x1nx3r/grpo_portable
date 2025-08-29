@@ -1,2 +1,6 @@
 __pycache__
 venv
+unsloth_compiled_cache
+downloaded_models
+format_sft_lora_h100
+logs
