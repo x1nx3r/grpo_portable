@@ -168,11 +168,9 @@ def build_synthetic_from_gsm8k(n_samples=2000, split='train'):
         return samples
 
 
-# format-only reward used for GRPO
+# strict format reward used for GRPO (kept for backward compatibility)
 def format_reward_fn(completions, **kwargs):
-    # completions can be in different forms depending on TRL/transformers version:
-    # - list of lists of dicts: [[{'content': '...'}], ...]
-    # - list of strings: ['...', ...]
+    # legacy strict reward: 1.0 only when both canonical <think> and <answer> exist
     contents = []
     for c in completions:
         try:
@@ -183,7 +181,6 @@ def format_reward_fn(completions, **kwargs):
             elif isinstance(c, dict) and 'content' in c:
                 contents.append(c.get('content', ''))
             else:
-                # fallback to string conversion
                 contents.append(str(c))
         except Exception:
             contents.append('')
@@ -198,6 +195,69 @@ def format_reward_fn(completions, **kwargs):
 
     out = [score(t) for t in contents]
     return out
+
+
+# Build an enhanced/soft format reward allowing tag variants and partial credit
+ALT_THINK_RE = re.compile(r"<(think|reasoning|r1response)[^>]*>.*?</(think|reasoning|r1response)>", flags=re.IGNORECASE | re.DOTALL)
+ALT_ANSWER_RE = re.compile(r"<(answer|ans|solution|final_answer|solution_text)[^>]*>.*?</(answer|ans|solution|final_answer|solution_text)>", flags=re.IGNORECASE | re.DOTALL)
+
+def build_format_reward(mode: str = 'strict'):
+    """Return a reward function suitable for TRL/GRPO.
+
+    mode: 'strict' -> only canonical tags give full credit;
+          'soft'   -> partial credit for partial/variant formatting.
+    """
+    def reward_fn(completions, **kwargs):
+        contents = []
+        for c in completions:
+            try:
+                if isinstance(c, str):
+                    contents.append(c)
+                elif isinstance(c, (list, tuple)) and len(c) > 0 and isinstance(c[0], dict):
+                    contents.append(c[0].get('content', ''))
+                elif isinstance(c, dict) and 'content' in c:
+                    contents.append(c.get('content', ''))
+                else:
+                    contents.append(str(c))
+            except Exception:
+                contents.append('')
+
+        def score_text(text: str) -> float:
+            try:
+                # canonical tags
+                has_think = bool(XML_THINK_PAT.search(text))
+                has_answer = bool(XML_ANSWER_PAT.search(text))
+                if mode == 'strict':
+                    return 1.0 if (has_think and has_answer) else 0.0
+
+                # soft mode: consider variants and partial credit
+                alt_think = bool(ALT_THINK_RE.search(text))
+                alt_answer = bool(ALT_ANSWER_RE.search(text))
+
+                # full credit if canonical both
+                if has_think and has_answer:
+                    return 1.0
+                # high credit if one canonical and one variant
+                if (has_think and alt_answer) or (alt_think and has_answer):
+                    return 0.9
+                # medium credit if both variants
+                if alt_think and alt_answer:
+                    return 0.8
+                # partial credit for only one side present
+                if has_think or alt_think:
+                    return 0.5
+                if has_answer or alt_answer:
+                    return 0.5
+                # small credit if we detect XML-like structure (angle brackets)
+                if '<' in text and '>' in text:
+                    return 0.2
+                return 0.0
+            except Exception:
+                return 0.0
+
+        return [score_text(t) for t in contents]
+
+    return reward_fn
 
 
 def do_ce_finetune(tokenizer, model, sft_dataset, output_dir, epochs=1, per_device_batch=4):
@@ -235,7 +295,7 @@ def do_ce_finetune(tokenizer, model, sft_dataset, output_dir, epochs=1, per_devi
     return True
 
 
-def train_adapter_a_with_grpo(model, tokenizer, train_dataset, output_dir, lora_r=16, max_steps=200, target_format=0.99):
+def train_adapter_a_with_grpo(model, tokenizer, train_dataset, output_dir, lora_r=16, max_steps=200, target_format=0.99, reward_mode: str = 'auto'):
     # apply LoRA
     if get_peft_model is None or LoraConfig is None:
         logger.error('PEFT not available; cannot create LoRA adapter')
@@ -274,10 +334,46 @@ def train_adapter_a_with_grpo(model, tokenizer, train_dataset, output_dir, lora_
 
     grad_hooks = _register_grad_sanitizer(model)
 
-    # configure GRPO with format-only reward
+    # determine and configure GRPO reward function
     if GRPOConfig is None or GRPOTrainer is None:
         logger.error('TRL GRPO not available; cannot run GRPO')
         return False
+    # preflight reward sanity check when in 'auto' mode: run strict reward on a
+    # few synthetic completions from train_dataset; if all zeros, switch to soft.
+    chosen_mode = reward_mode
+    try:
+        if reward_mode == 'auto':
+            # extract up to 16 completion strings from the provided dataset
+            sample_comps = []
+            try:
+                # train_dataset may be a list of dicts or a datasets.Dataset
+                iterator = train_dataset if isinstance(train_dataset, list) else list(train_dataset)
+                for ex in iterator[:16]:
+                    if isinstance(ex, dict):
+                        sample_comps.append(ex.get('completion', ''))
+                    else:
+                        # fallback: string
+                        sample_comps.append(str(ex))
+            except Exception:
+                sample_comps = []
+
+            if sample_comps:
+                strict_rewards = format_reward_fn(sample_comps)
+                mean_strict = float(np.mean(strict_rewards)) if len(strict_rewards) > 0 else 0.0
+                logger.info('Preflight strict-format mean reward on synthetic samples: %f', mean_strict)
+                if mean_strict <= 0.0:
+                    logger.info('Strict reward returned zero on synthetic completions; switching to soft reward mode')
+                    chosen_mode = 'soft'
+                else:
+                    chosen_mode = 'strict'
+            else:
+                logger.info('No sample completions available for preflight; defaulting to soft reward')
+                chosen_mode = 'soft'
+    except Exception:
+        logger.exception('Preflight reward check failed; defaulting to soft')
+        chosen_mode = 'soft'
+
+    reward_fn = build_format_reward(mode=chosen_mode)
 
     args = GRPOConfig(
         learning_rate=1e-6,
@@ -304,7 +400,7 @@ def train_adapter_a_with_grpo(model, tokenizer, train_dataset, output_dir, lora_
         output_dir=output_dir,
     )
 
-    trainer = GRPOTrainer(model=model, processing_class=tokenizer, reward_funcs=[format_reward_fn], args=args, train_dataset=train_dataset)
+    trainer = GRPOTrainer(model=model, processing_class=tokenizer, reward_funcs=[reward_fn], args=args, train_dataset=train_dataset)
 
     # run training and monitor format pass rate on a small val split
     try:
@@ -341,8 +437,11 @@ def parse_args(argv):
     p.add_argument('--use_gsm8k', action='store_true', help='Build synthetic formatting samples from GSM8K')
     p.add_argument('--do_ce', action='store_true')
     p.add_argument('--ce_epochs', type=int, default=1)
+    p.add_argument('--ce_batch', type=int, default=4, help='Per-device batch size for CE finetune')
+    p.add_argument('--ce_device', choices=['auto', 'cpu', 'gpu'], default='auto', help='Device for CE finetune (auto will use GPU if available)')
     p.add_argument('--lora_r', type=int, default=16)
     p.add_argument('--max_steps', type=int, default=200)
+    p.add_argument('--reward_mode', choices=['auto', 'strict', 'soft'], default='auto', help='Format reward mode: auto (preflight), strict, or soft')
     return p.parse_args(argv)
 
 
@@ -357,8 +456,13 @@ def main(argv):
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     model_kwargs = dict(trust_remote_code=True)
+    # allow CE to be executed on CPU to avoid GPU OOM for small synthetic finetunes
     if torch is not None:
-        model_kwargs['device_map'] = 'auto'
+        if getattr(args, 'ce_device', 'auto') == 'cpu' and getattr(args, 'do_ce', False):
+            model_kwargs['device_map'] = 'cpu'
+        else:
+            # default: load with automatic device placement (GPU if available)
+            model_kwargs['device_map'] = 'auto'
         model_kwargs['torch_dtype'] = torch.float32
     model = AutoModelForCausalLM.from_pretrained(args.model, **model_kwargs)
 
@@ -382,12 +486,12 @@ def main(argv):
 
     # optional CE finetune
     if args.do_ce:
-        logger.info('Running CE finetune for %d epochs', args.ce_epochs)
-        do_ce_finetune(tokenizer, model, sft_ds, output_dir=args.output, epochs=args.ce_epochs)
+        logger.info('Running CE finetune for %d epochs (per-device batch=%d)', args.ce_epochs, args.ce_batch)
+        do_ce_finetune(tokenizer, model, sft_ds, output_dir=args.output, epochs=args.ce_epochs, per_device_batch=args.ce_batch)
 
     # run GRPO format-only to create Adapter A
     logger.info('Running GRPO format-only for Adapter A')
-    ok = train_adapter_a_with_grpo(model, tokenizer, sft_ds, os.path.join(args.output, 'adapter_a'), lora_r=args.lora_r, max_steps=args.max_steps)
+    ok = train_adapter_a_with_grpo(model, tokenizer, sft_ds, os.path.join(args.output, 'adapter_a'), lora_r=args.lora_r, max_steps=args.max_steps, reward_mode=args.reward_mode)
     if not ok:
         logger.error('Adapter A training failed')
         return 2
