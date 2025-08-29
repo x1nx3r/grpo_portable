@@ -91,11 +91,12 @@ def make_synthetic_format_sample(i):
     q = f"What is {i} plus {i}?"
     reasoning = f"{i} + {i} = {i*2}"
     answer = str(i*2)
-    prompt = (
-        "System: Please answer in R1 XML-COT format.\n"
-        f"User: {q}\n"
+    # keep synthetic prompts minimal; do not inject a system instruction by default
+    prompt = f"User: {q}\n"
+    completion = (
+        f"<think>\n{reasoning}\n</think>"
+        f"\n<answer>\n{answer}\n</answer>"
     )
-    completion = f"<think>{reasoning}</think><answer>{answer}</answer>"
     return {'prompt': prompt, 'completion': completion}
 
 

@@ -40,6 +40,7 @@ def parse_args(argv: List[str]):
     p.add_argument('--n_samples', type=int, default=3, help='Number of synthetic prompts to run when --prompt is not given')
     p.add_argument('--max_new_tokens', type=int, default=128)
     p.add_argument('--no_prefix_think', action='store_true', help='Disable automatic prefixing of prompts with "<think>"')
+    p.add_argument('--system_prompt', action='store_true', help='If set, prepend a system prompt requesting <reasoning>/<answer> format')
     return p.parse_args(argv)
 
 
@@ -104,6 +105,27 @@ def build_prompts(args):
 
     return prompts
 
+def maybe_wrap_with_system_prompt(args, prompts):
+    # System prompt is opt-in to avoid injecting instructions into datasets
+    if not getattr(args, 'system_prompt', False):
+        return prompts
+
+    # Clear, minimal system instruction requesting XML-COT with explicit examples
+    system_prefix = (
+        "System: Please respond using R1 XML-COT format.\n"
+        "Include a <reasoning> section containing your chain-of-thought, then an <answer> section with the final concise answer.\n"
+        "Example:\n<reasoning>\nYour step-by-step reasoning here\n</reasoning>\n<answer>\nFinal answer here\n</answer>\n\n"
+    )
+    wrapped = []
+    for p in prompts:
+        # if user already included tags, don't double-wrap
+        low = p.lower()
+        if '<reasoning>' in low or '<answer>' in low:
+            wrapped.append(p)
+        else:
+            wrapped.append(system_prefix + p)
+    return wrapped
+
 
 def generate_and_print(model, tokenizer, prompts, max_new_tokens=128):
     device = next(model.parameters()).device
@@ -140,6 +162,7 @@ def main(argv):
         logger.exception('Failed to add special tokens and resize (continuing)')
 
     prompts = build_prompts(args)
+    prompts = maybe_wrap_with_system_prompt(args, prompts)
     generate_and_print(model, tokenizer, prompts, max_new_tokens=args.max_new_tokens)
     return 0
 

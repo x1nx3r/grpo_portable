@@ -45,8 +45,14 @@ def make_synthetic_format_sample(i:int):
     q = f"What is {i} plus {i}?"
     reasoning = f"{i} + {i} = {i*2}"
     answer = str(i*2)
-    prompt = "System: Please answer in R1 XML-COT format.\nUser: " + q + "\n"
-    completion = f"<think>{reasoning}</think><answer>{answer}</answer>"
+    # Do not inject a system-level instruction by default; keep synthetic prompts
+    # minimal so callers can opt-in to any system wrapper.
+    prompt = "User: " + q + "\n"
+    # Use newline-separated XML-style tags so parsers can reliably extract content
+    completion = (
+        f"<think>\n{reasoning}\n</think>"
+        f"\n<answer>\n{answer}\n</answer>"
+    )
     return {'prompt': prompt, 'completion': completion}
 
 def build_synthetic_dataset(n_samples=2000, seed=42):

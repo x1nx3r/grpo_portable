@@ -32,6 +32,8 @@ def parse_args(argv):
     p.add_argument('--out_dir', default='./logs')
     p.add_argument('--n_samples', type=int, default=5)
     p.add_argument('--max_new_tokens', type=int, default=256)
+    p.add_argument('--system_prompt', action='store_true', help='Prepend a standard system prompt requesting XML-COT format')
+    p.add_argument('--system_prompt_text', default=None, help='Custom system prompt text to prepend when --system_prompt is set')
     p.add_argument('--device', choices=['auto','cpu','gpu'], default='auto')
     return p.parse_args(argv)
 
@@ -131,6 +133,22 @@ def main(argv):
 
     prompts = load_prompts(args.sft_file, args.n_samples)
 
+    # Optionally prepend a system prompt requesting R1 XML-COT format
+    if getattr(args, 'system_prompt', False):
+        default_sys = (
+            "System: Please respond using R1 XML-COT format.\n"
+            "Include a <reasoning> section with a brief chain-of-thought, then an <answer> section with the final concise answer.\n\n"
+        )
+        sys_text = args.system_prompt_text if args.system_prompt_text is not None else default_sys
+        new_prompts = []
+        for p in prompts:
+            low = p.lower()
+            if '<reasoning>' in low or '<answer>' in low:
+                new_prompts.append(p)
+            else:
+                new_prompts.append(sys_text + p)
+        prompts = new_prompts
+
     os.makedirs(args.out_dir, exist_ok=True)
     out_path = os.path.join(args.out_dir, 'adapter_probe_generation.txt')
 
@@ -143,7 +161,44 @@ def main(argv):
                 device = next(model.parameters()).device
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 out_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
-                text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+                # Attempt to decode only the newly generated tokens (exclude the prompt)
+                try:
+                    input_len = inputs['input_ids'].shape[1]
+                    gen_ids = out_ids[0][input_len:]
+                    if gen_ids.numel() == 0:
+                        # fallback to full decode
+                        text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+                    else:
+                        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                except Exception:
+                    text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
+
+                # Post-process: ensure we return a well-formed XML-COT with <reasoning> and <answer>
+                def ensure_xml_cot(s: str) -> str:
+                    low = s.lower()
+                    has_reason = '<reasoning>' in low or '<think>' in low
+                    has_answer = '<answer>' in low
+                    # If already contains both canonical tags, return as-is
+                    if has_reason and has_answer:
+                        return s
+                    # Otherwise, try to split into reasoning + answer heuristically
+                    lines = [l.strip() for l in s.splitlines() if l.strip()]
+                    if not lines:
+                        return "<reasoning>\n(No content)\n</reasoning>\n<answer>\n(No answer)\n</answer>"
+                    # heuristic: last line that contains a number or short phrase is answer
+                    import re
+                    ans = None
+                    for ln in reversed(lines[-3:]):
+                        m = re.search(r"(-?\d+[\.,]?\d*)$", ln)
+                        if m:
+                            ans = m.group(1)
+                            break
+                    if ans is None and len(lines) >= 1:
+                        ans = lines[-1]
+                    reasoning = "\n".join(lines[:-1]) if len(lines) > 1 else lines[0]
+                    return f"<reasoning>\n{reasoning}\n</reasoning>\n<answer>\n{ans}\n</answer>"
+
+                text = ensure_xml_cot(text)
                 decor = f"--- SAMPLE {i+1} ---\nPROMPT:\n{prompt}\n\nOUTPUT:\n{text}\n\n"
                 print(decor)
                 outf.write(decor)
