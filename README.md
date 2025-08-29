@@ -27,3 +27,25 @@ Quickstart (assumes a Python 3.11 venv with GPU tooling available):
 Notes:
 - The repository is a minimal portable snapshot for replication. Adjust hyperparameters and flags for larger machines.
 - For debugging, set DEBUG_ANOMALY=1 to enable torch anomaly detection (slower).
+
+Pyenv (optional)
+
+If you use pyenv to manage Python versions, add the following to your shell startup files so pyenv and pyenv-virtualenv are available for login and interactive shells (do not run from this repo — add to your shell config, e.g. `~/.bash_profile` / `~/.profile` and `~/.bashrc`):
+
+# Load pyenv automatically by appending
+# the following to 
+# ~/.bash_profile if it exists, otherwise ~/.profile (for login shells)
+# and ~/.bashrc (for interactive shells) :
+
+export PYENV_ROOT="$HOME/.pyenv"
+[[ -d $PYENV_ROOT/bin ]] && export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init - bash)"
+
+# Restart your shell for the changes to take effect.
+
+# Load pyenv-virtualenv automatically by adding
+# the following to ~/.bashrc:
+
+eval "$(pyenv virtualenv-init -)"
+
+Note: this repository cannot modify files in your home directory; add the lines above to your shell config manually.

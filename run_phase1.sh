@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# If pyenv is installed in the user's home, load it so the venv/python selection works.
+# This does not modify any home files; it only attempts to source pyenv at runtime when available.
+export PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
+if [[ -d "$PYENV_ROOT" && -x "$PYENV_ROOT/bin/pyenv" ]]; then
+	export PATH="$PYENV_ROOT/bin:$PATH"
+	# initialize pyenv (bash) and pyenv-virtualenv if available
+	eval "$(pyenv init - bash)" || true
+	if command -v pyenv-virtualenv-init >/dev/null 2>&1; then
+		eval "$(pyenv virtualenv-init -)" || true
+	fi
+fi
+
 # Example run script for Phase1 (50 steps)
 MODEL_LOCAL=${MODEL_LOCAL_PATH:-./downloaded_models/llama-3.2-3b}
 LOGDIR=./logs
