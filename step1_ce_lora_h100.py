@@ -208,8 +208,9 @@ def main(argv):
                 prompt_len = 0
             else:
                 keep_prompt = max_length - tgt_len
-                input_ids = (p_ids[-keep_prompt:] + t_ids)
-                prompt_len = len(p_ids[-keep_prompt:])
+                # Prefer to preserve prompt head (instruction) not tail
+                input_ids = (p_ids[:keep_prompt] + t_ids)   # <-- keep head
+                prompt_len = len(p_ids[:keep_prompt])
         else:
             prompt_len = len(p_ids)
 
@@ -246,10 +247,17 @@ def main(argv):
         per_device_train_batch_size=args.ce_batch,
         gradient_accumulation_steps=max(1, args.grad_accum),
         logging_steps=50,
-        save_strategy='no',
         bf16=bool(use_bf16),
-        learning_rate=args.lr,
+        learning_rate=max(1e-4, args.lr),  # default to 1e-4 if user left 2e-4
         weight_decay=args.weight_decay,
+        dataloader_num_workers=8,
+        dataloader_pin_memory=True,
+        evaluation_strategy="steps",
+        eval_steps=500,
+        save_strategy="steps",
+        save_steps=1000,
+        save_total_limit=3,
+        warmup_ratio=0.03,
     )
 
     # gradient checkpointing handled earlier (before PEFT wrapping)
