@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""H100-optimized Step 1 (LoRA): CE finetune tuned for powerful GPUs (bf16)
+"""H100-optimized Step 1 (LoRA) - safe defaults copy
 
-This script mirrors `step1_ce_lora.py` but changes sensible defaults for an
-H100-class GPU: bf16, larger LoRA rank/alpha, bigger batch sizes, optional
-gradient checkpointing and a few additional hyperparameters exposed.
+This file is a duplicate of `step1_ce_lora_h100.py` with small, safe changes:
+- pack_examples default enabled
+- cap model-facing tokenization to `training_max = min(args.max_length, 2048)` to limit activation size
+- trim completions at string level to preserve closing </answer> tag before token-level truncation
 """
 
 # Set environment variables early to avoid tokenizer parallelism warnings and
@@ -51,7 +52,7 @@ except Exception:
     BitsAndBytesConfig = None  # type: ignore
     bnb = None
 
-logger = logging.getLogger('step1_ce_lora_h100')
+logger = logging.getLogger('step1_ce_lora_h100_safe')
 logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
@@ -59,19 +60,19 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 def parse_args(argv):
     p = argparse.ArgumentParser()
     p.add_argument('--model', default=os.environ.get('MODEL_LOCAL_PATH','./downloaded_models/llama-3.2-3b'))
-    p.add_argument('--output', default='./format_sft_lora_h100')
+    p.add_argument('--output', default='./format_sft_lora_h100_safe')
     p.add_argument('--sft_samples', type=int, default=8000)
-    # Use a generous max_length so we don't truncate completions (many completions end with </answer>). 
+    # Use a generous max_length so we don't truncate completions (many completions end with </answer>).
     # Packing via --pack_examples will mitigate padding overhead by concatenating short examples.
     p.add_argument('--max_length', type=int, default=10000, help='Maximum token length for prompt+completion (large by default; use packing to avoid wasted padding)')
-    p.add_argument('--pack_examples', action='store_true', help='Enable packing multiple short examples into longer sequences to reduce padding waste')
-    # default to repo-root JSONL (previous default pointed to ./grpo_portable/...,
-    # which caused a duplicate path when running from the repo root)
+    # enable packing by default in this safe variant
+    p.add_argument('--pack_examples', action='store_true', default=True, help='Enable packing multiple short examples into longer sequences to reduce padding waste (default: True)')
+    # default to repo-root JSONL (previous default pointed to ./grpo_portable/...,)
     p.add_argument('--sft_file', default='./sft_from_deepseek_full.canonical.jsonl',
                    help='Path to JSONL SFT file with {"prompt","completion"} per line (optional)')
     p.add_argument('--ce_epochs', type=int, default=3)
-    # larger per-device batch assumed on H100
-    p.add_argument('--ce_batch', type=int, default=2, help='Per-device train batch size (baked OOM-safe default)')
+    # smaller per-device batch to be safe with long contexts
+    p.add_argument('--ce_batch', type=int, default=2, help='Per-device train batch size (safe default)')
     # larger LoRA rank for richer adapters
     p.add_argument('--lora_r', type=int, default=64)
     p.add_argument('--lora_alpha', type=int, default=128)
@@ -80,7 +81,7 @@ def parse_args(argv):
     p.add_argument('--weight_decay', type=float, default=0.0)
     p.add_argument('--grad_accum', type=int, default=16, help='Gradient accumulation steps (baked to preserve effective batch)')
     p.add_argument('--device', choices=['auto','cpu','gpu'], default='auto')
-    p.add_argument('--save_adapter_name', default='adapter_lora_h100')
+    p.add_argument('--save_adapter_name', default='adapter_lora_h100_safe')
     # enable gradient checkpointing by default on H100; keep flag to allow future explicit control
     p.add_argument('--use_grad_checkpoint', action='store_true', default=True,
                    help='Enable gradient checkpointing if supported (default: True)')
@@ -314,9 +315,23 @@ def main(argv):
         prompt = x['prompt']
         tgt = x['completion']
 
+        # Short-term safe behavior: cap training tokens to a modest training_max to limit activations
+        training_max = min(int(args.max_length), 2048)
+
+        # Trim completion at string-level to preserve closing tag when present
+        try:
+            if isinstance(tgt, str):
+                closing = '</answer>'
+                idx = tgt.rfind(closing)
+                if idx != -1:
+                    # keep everything up to and including the last closing tag
+                    tgt = tgt[:idx + len(closing)]
+        except Exception:
+            pass
+
         # encode without padding so we can control truncation strategy
-        enc_prompt = tokenizer(prompt, truncation=True, padding=False, max_length=args.max_length)
-        enc_tgt = tokenizer(tgt, truncation=True, padding=False, max_length=args.max_length)
+        enc_prompt = tokenizer(prompt, truncation=True, padding=False, max_length=training_max)
+        enc_tgt = tokenizer(tgt, truncation=True, padding=False, max_length=training_max)
 
         p_ids = enc_prompt.get('input_ids', [])
         t_ids = enc_tgt.get('input_ids', [])
@@ -583,7 +598,7 @@ def main(argv):
 
     trainer = Trainer(model=model, args=args_tr, train_dataset=cast(Any, train_ds), data_collator=collate_fn)
 
-    logger.info('Starting H100-tuned LoRA CE finetune: %d examples, epochs=%d, batch=%d', len(sft), args.ce_epochs, args.ce_batch)
+    logger.info('Starting H100-tuned LoRA CE finetune (safe): %d examples, epochs=%d, batch=%d', len(sft), args.ce_epochs, args.ce_batch)
 
     # Run training with OOM-resilience: on CUDA OOM reduce batch size and retry.
     # We attempt a few retries to recover from fragmentation or memory pressure.
@@ -643,35 +658,4 @@ def main(argv):
                 args_tr_kwargs['gradient_accumulation_steps'] = int(new_grad_accum)
                 import inspect
                 sig = inspect.signature(TrainingArguments)
-                valid_keys = {k for k in args_tr_kwargs.keys() if k in sig.parameters}
-                filtered_kwargs = {k: args_tr_kwargs[k] for k in valid_keys}
-                args_tr = TrainingArguments(**filtered_kwargs)
-                trainer = Trainer(model=model, args=args_tr, train_dataset=cast(Any, train_ds), data_collator=collate_fn)
-            except Exception:
-                # best-effort: fall back to setting attribute when possible
-                try:
-                    args_tr.per_device_train_batch_size = current_batch
-                    args_tr.gradient_accumulation_steps = int(new_grad_accum)
-                except Exception:
-                    pass
-            # free CUDA cache and try again
-            try:
-                if torch is not None:
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-    # save adapter only
-    adapter_out = os.path.join(args.output, args.save_adapter_name)
-    try:
-        if hasattr(model, 'save_pretrained'):
-            model.save_pretrained(adapter_out)
-            logger.info('Saved LoRA adapter to %s', adapter_out)
-    except Exception:
-        logger.exception('Failed to save LoRA adapter')
-
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main(sys.argv[1:]))
+*** End Patch

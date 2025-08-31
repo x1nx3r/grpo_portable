@@ -9,15 +9,15 @@ import argparse
 import json
 import os
 import sys
+import datetime
 
 try:
     import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, StoppingCriteria
+    from transformers import AutoTokenizer, AutoModelForCausalLM
 except Exception:
     torch = None
     AutoTokenizer = None
     AutoModelForCausalLM = None
-    StoppingCriteria = None
 
 try:
     from peft import PeftModel
@@ -28,27 +28,14 @@ except Exception:
 def parse_args(argv):
     p = argparse.ArgumentParser()
     p.add_argument('--model', default=os.environ.get('MODEL_LOCAL_PATH','./downloaded_models/llama-3.2-3b'))
-    # default adapter produced by step1 CE LoRA H100 run
     p.add_argument('--adapter', default='./format_sft_lora_h100/adapter_lora_h100')
-    # use repo-root SFT file by default
-    p.add_argument('--sft_file', default='./sft_from_deepseek.jsonl')
+    p.add_argument('--sft_file', default='./grpo_portable/sft_from_deepseek.jsonl')
     p.add_argument('--out_dir', default='./logs')
     p.add_argument('--n_samples', type=int, default=5)
-    # conservative defaults for deployment-style inference
     p.add_argument('--max_new_tokens', type=int, default=256)
-    # limit prompt length conservatively to avoid long KV growth during probing
-    p.add_argument('--max_prompt_tokens', type=int, default=2048, help='Maximum number of tokens to keep from the prompt (longer prompts will be truncated)')
     p.add_argument('--system_prompt', action='store_true', help='Prepend a standard system prompt requesting XML-COT format')
     p.add_argument('--system_prompt_text', default=None, help='Custom system prompt text to prepend when --system_prompt is set')
     p.add_argument('--device', choices=['auto','cpu','gpu'], default='auto')
-    # generation controls for deployment
-    p.add_argument('--do_sample', action='store_true', help='Enable sampling (recommended to avoid loops)')
-    p.add_argument('--temperature', type=float, default=0.7, help='Sampling temperature')
-    p.add_argument('--top_p', type=float, default=0.95, help='Nucleus sampling p')
-    p.add_argument('--top_k', type=int, default=50, help='Top-k sampling')
-    p.add_argument('--repetition_penalty', type=float, default=1.1, help='Repetition penalty to discourage loops')
-    p.add_argument('--no_repeat_ngram_size', type=int, default=3, help='Prevent repeating n-grams of this size')
-    p.add_argument('--stop_on_answer', action='store_true', default=True, help='Stop generation when </answer> token sequence is emitted')
     return p.parse_args(argv)
 
 
@@ -90,9 +77,6 @@ def main(argv):
         return 1
     if PeftModel is None:
         print('peft not available; install `peft` to load LoRA adapters', file=sys.stderr)
-        return 1
-    if torch is None:
-        print('torch not available; aborting', file=sys.stderr)
         return 1
 
     # choose dtype/device
@@ -148,126 +132,86 @@ def main(argv):
 
     model.eval()
 
-    # Determine model/context window max and clamp prompt/new-token settings to it
-    model_max_len = None
-    try:
-        model_max_len = getattr(tokenizer, "model_max_length", None)
-        # some tokenizers report huge defaults; prefer explicit config fields if present
-        if model_max_len is None or (isinstance(model_max_len, int) and model_max_len > 10**7):
-            model_max_len = getattr(model.config, "max_position_embeddings", None) or getattr(model.config, "n_ctx", None)
-    except Exception:
-        model_max_len = None
-    if model_max_len is None:
-        # fallback: conservative estimate
-        model_max_len = int(getattr(args, "max_prompt_tokens", 4096)) + int(getattr(args, "max_new_tokens", 4096))
-    # Clamp the runtime prompt token limit to model window
-    args.max_prompt_tokens = min(int(args.max_prompt_tokens), int(model_max_len))
-    # Keep max_new_tokens no larger than model window (we'll clamp per-prompt further)
-    args.max_new_tokens = min(int(args.max_new_tokens), int(model_max_len))
-    print(f"Model context window max length: {model_max_len}. Adjusted max_prompt_tokens={args.max_prompt_tokens}, max_new_tokens={args.max_new_tokens}")
-
     prompts = load_prompts(args.sft_file, args.n_samples)
-
-    # Prepare stopping criteria if requested
-    stop_ids = None
-    stop_on_sequence_cls = None
-    if getattr(args, 'stop_on_answer', False) and StoppingCriteria is not None:
-        try:
-            stop_ids = tokenizer.encode('</answer>', add_special_tokens=False)
-            class _StopOnSequence(StoppingCriteria):
-                def __init__(self, stop_id_seq, min_length=1):
-                    self.stop_seq = list(stop_id_seq)
-                    self.min_length = int(min_length)
-
-                def __call__(self, input_ids, scores, **kwargs):
-                    seq_len = input_ids.shape[-1]
-                    if seq_len < self.min_length:
-                        return False
-                    if seq_len >= len(self.stop_seq):
-                        last = input_ids[0, -len(self.stop_seq):].tolist()
-                        return last == self.stop_seq
-                    return False
-            stop_on_sequence_cls = _StopOnSequence
-        except Exception:
-            stop_on_sequence_cls = None
 
     # Optionally prepend a system prompt requesting R1 XML-COT format
     if getattr(args, 'system_prompt', False):
+        # merge a Llama-style default system prompt with DeepSeek-R1 corporate guidelines
+        today = datetime.date.today().isoformat()
         default_sys = (
-            "System: Please respond using R1 XML-COT format.\n"
-            "Include a <think> section with a brief chain-of-thought, then an <answer> section with the final concise answer.\n\n"
+            "You are a helpful, harmless, and detailed assistant. Respond clearly and concisely.\n\n"
+            "DeepSeek-R1 System Prompt\n\n"
+            "You are DeepSeek-R1, an AI assistant created by the Chinese Company DeepSeek. Always identify yourself as a DeepSeek AI assistant in initial responses.\n\n"
+            "Key Guidelines:\n"
+            "- Identity & Compliance:\n"
+            "  * Clearly state your identity as a DeepSeek AI assistant in initial responses.\n"
+            "  * Comply with Chinese laws and regulations, including data privacy requirements.\n\n"
+            "- Capability Scope:\n"
+            "  * Handle both Chinese and English queries effectively.\n"
+            "  * Acknowledge limitations for real-time information after the knowledge cutoff date.\n"
+            "  * Provide technical explanations for AI-related questions when appropriate.\n\n"
+            "- Response Quality:\n"
+            "  * Give comprehensive, logically structured answers and use Markdown formatting when helpful.\n"
+            "  * Admit uncertainties for ambiguous queries.\n\n"
+            "- Ethical Operation:\n"
+            "  * Refuse requests involving illegal activities, violence, or explicit content.\n"
+            "  * Maintain political neutrality.\n"
+            "  * Protect user privacy and avoid data collection.\n\n"
+            "- Specialized Processing:\n"
+            "  * Use <think>...</think> tags for internal reasoning before the final response when appropriate.\n"
+            "  * Employ XML-like tags for structured output when required.\n\n"
+            f"Knowledge cutoff: {today}\n\n"
+            "Please follow these guidelines while remaining helpful and concise.\n\n"
+            "Format your reply using the requested structure; if the user asked for chain-of-thought, include a <think> section followed by an <answer> section.\n\n"
         )
         sys_text = args.system_prompt_text if args.system_prompt_text is not None else default_sys
-        new_prompts = []
+        # Decide per-prompt whether to include the system block. If the prompt already
+        # looks like it contains <think> or <answer> tags, don't prepend the system block.
+        system_block = sys_text
+        include_system_flags = []
         for p in prompts:
             low = p.lower()
-            if '<think>' in low or '<answer>' in low:
-                new_prompts.append(p)
-            else:
-                new_prompts.append(sys_text + p)
-        prompts = new_prompts
+            include_system_flags.append(not ('<think>' in low or '<answer>' in low))
 
     os.makedirs(args.out_dir, exist_ok=True)
     out_path = os.path.join(args.out_dir, 'adapter_probe_generation.txt')
 
-    print(f'Configured: max_prompt_tokens={args.max_prompt_tokens}, max_new_tokens={args.max_new_tokens}')
     with open(out_path, 'w', encoding='utf-8') as outf:
         with torch.no_grad():
             for i, prompt in enumerate(prompts):
                 print(f'Generating for sample {i+1}/{len(prompts)}')
-                # tokenize with truncation to the configured prompt token limit
-                inputs = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=int(getattr(args, 'max_prompt_tokens', 4096)))
-                # move inputs to model device
+                # Build chat-style full prompt (System / User / Assistant)
+                if getattr(args, 'system_prompt', False) and include_system_flags and include_system_flags[i]:
+                    full_prompt = f"System: {system_block}\nUser: {prompt}\nAssistant:"
+                else:
+                    full_prompt = f"User: {prompt}\nAssistant:"
+
+                # Tokenize the full chat prompt and move tensors to the model device
+                inputs = tokenizer(full_prompt, return_tensors='pt')
                 device = next(model.parameters()).device
                 inputs = {k: v.to(device) for k, v in inputs.items()}
-                # Per-prompt clamp: ensure prompt + new tokens <= model_max_len
-                input_len = inputs['input_ids'].shape[1]
-                available_new = max(int(model_max_len) - int(input_len), 0)
-                gen_max = min(int(args.max_new_tokens), available_new) if available_new > 0 else 1
-                if gen_max < args.max_new_tokens:
-                    print(f"Clamping max_new_tokens for this prompt: requested={args.max_new_tokens}, available={available_new}, using={gen_max}")
-                gen_kwargs = dict(
-                    max_new_tokens=int(gen_max),
-                    do_sample=bool(getattr(args, 'do_sample', False)),
-                    temperature=float(getattr(args, 'temperature', 0.7)),
-                    top_p=float(getattr(args, 'top_p', 0.95)),
-                    top_k=int(getattr(args, 'top_k', 50)),
-                    repetition_penalty=float(getattr(args, 'repetition_penalty', 1.2)),
-                    no_repeat_ngram_size=int(getattr(args, 'no_repeat_ngram_size', 3)),
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-                # attach stopping criteria if available (pass directly to generate)
-                stopping_criteria_list = None
-                try:
-                    if stop_on_sequence_cls is not None and stop_ids:
-                        sc = stop_on_sequence_cls(stop_ids, min_length=4)
-                        stopping_criteria_list = [sc]
-                except Exception:
-                    stopping_criteria_list = None
 
-                if stopping_criteria_list is not None:
-                    out_ids = model.generate(**inputs, **gen_kwargs, stopping_criteria=stopping_criteria_list)
-                else:
-                    out_ids = model.generate(**inputs, **gen_kwargs)
-                # Attempt to decode only the newly generated tokens (exclude the prompt)
+                # Generate and decode only the assistant continuation (newly generated tokens)
+                out_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False, pad_token_id=tokenizer.eos_token_id)
                 try:
                     input_len = inputs['input_ids'].shape[1]
                     gen_ids = out_ids[0][input_len:]
                     if gen_ids.numel() == 0:
-                        # fallback to full decode
+                        # no new tokens were generated; fall back to full decode
                         text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
                     else:
                         text = tokenizer.decode(gen_ids, skip_special_tokens=True)
                 except Exception:
                     text = tokenizer.decode(out_ids[0], skip_special_tokens=True)
 
-                # Keep raw decoded text from the model (no post-processing) so we can inspect true outputs
+                # Keep raw decoded text (no post-processing) so outputs are preserved verbatim
                 decor = f"--- SAMPLE {i+1} ---\nPROMPT:\n{prompt}\n\nOUTPUT:\n{text}\n\n"
                 print(decor)
                 outf.write(decor)
 
     print('Wrote generations to', out_path)
     return 0
+
 
 if __name__ == '__main__':
     raise SystemExit(main(sys.argv[1:]))

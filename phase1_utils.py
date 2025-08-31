@@ -29,14 +29,40 @@ def add_special_tokens_and_resize(tokenizer, model, save_dir=None):
         logger.warning('tokenizer/model missing; skip special token step')
         return tokenizer, model
     try:
-        added = tokenizer.add_tokens(SPECIAL_TOKENS)
-        logger.info('Added %d special tokens', added)
+        # Prefer adding as additional special tokens so tokenizer treats them as special
+        if hasattr(tokenizer, 'add_special_tokens'):
+            added = tokenizer.add_special_tokens({'additional_special_tokens': SPECIAL_TOKENS})
+            logger.info('Added %d additional special tokens', added)
+        else:
+            # fall back to add_tokens for legacy or custom tokenizers
+            added = tokenizer.add_tokens(SPECIAL_TOKENS)
+            logger.info('Fallback add_tokens: added %d tokens', added)
+
+        # Ensure a pad token exists (many tokenizers may lack one); default to eos token if available
+        try:
+            pad_id = getattr(tokenizer, 'pad_token_id', None)
+            eos_tok = getattr(tokenizer, 'eos_token', None)
+            if pad_id is None and eos_tok is not None:
+                tokenizer.pad_token = eos_tok
+                logger.info('Set tokenizer.pad_token to eos_token')
+        except Exception:
+            # non-fatal
+            logger.debug('Could not ensure pad token')
+
         if added > 0:
-            model.resize_token_embeddings(len(tokenizer))
-            logger.info('Resized embeddings to %d', len(tokenizer))
+            # resize model embeddings to match tokenizer vocabulary
+            try:
+                model.resize_token_embeddings(len(tokenizer))
+                logger.info('Resized embeddings to %d', len(tokenizer))
+            except Exception:
+                logger.exception('Failed to resize model embeddings')
+
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
-            tokenizer.save_pretrained(save_dir)
+            try:
+                tokenizer.save_pretrained(save_dir)
+            except Exception:
+                logger.exception('Failed to save tokenizer to %s', save_dir)
     except Exception:
         logger.exception('failed to add special tokens')
     return tokenizer, model
