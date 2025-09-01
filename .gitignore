@@ -5,3 +5,10 @@ downloaded_models
 format_sft_lora_h100
 logs
 merged_model
+.venv
+scripts
+gguf_convert
+full_weight_out
+llama.cpp
+gguf_convert
+gguf_converted

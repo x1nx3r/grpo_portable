@@ -28,7 +28,7 @@ except Exception:
 def parse_args(argv):
     p = argparse.ArgumentParser()
     p.add_argument('--model', default=os.environ.get('MODEL_LOCAL_PATH','./downloaded_models/llama-3.2-3b'))
-    p.add_argument('--adapter', default='./format_sft_lora_h100/adapter_lora_h100')
+    p.add_argument('--adapter', default='./full_weight_out')
     p.add_argument('--sft_file', default='./grpo_portable/sft_from_deepseek.jsonl')
     p.add_argument('--out_dir', default='./logs')
     p.add_argument('--n_samples', type=int, default=5)
